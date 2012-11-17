@@ -3,6 +3,7 @@
  * Copyright (c) 1993 Branko Lankester <branko@hacktic.nl>
  * Copyright (c) 1993, 1994, 1995, 1996 Rick Sladkey <jrs@world.std.com>
  * Copyright (c) 1996-1999 Wichert Akkerman <wichert@cistron.nl>
+ * Copyright (c) 2012 Andrey Devyatkin <andrey.a.devyatkin@gmail.com>
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -121,6 +122,7 @@ bool tracing_paths = 0;
 
 static bool detach_on_execve = 0;
 static bool skip_startup_execve = 0;
+static bool do_not_track = 0;
 
 static int exit_code = 0;
 static int strace_child = 0;
@@ -137,6 +139,7 @@ static char *acolumn_spaces;
 static char *outfname = NULL;
 static char *reportfname = NULL;
 static char *ignorefname = NULL;
+static char *inputfname = NULL;
 static char *substitute_environment_variables[MAX_S_ENV];
 /* If -ff, points to stderr. Else, it's our common output log */
 static FILE *shared_log;
@@ -186,18 +189,23 @@ strerror(int err_no)
 static void
 usage(FILE *ofp, int exitval)
 {
-	fprintf(ofp, "\
+  fprintf(ofp, "\
 Revisor is a very limited version of strace 4.7 (http://sourceforge.net/projects/strace)\n\
 Main purpose of revisor is to trace file usage during a command execution\n\
 \n\
-usage: revisor -o file [-i file] [-h] [-v] PROG [ARGS]\n\
--o file -- report file\n\
+usage: revisor -o file [-i file] [-c|-n file] [-s ENV] [-h] [-v] PROG [ARGS]\n\
+-o file -- output file to store report file\n\
 -i file -- file with ignore rules\n\
--h      -- show this message\n\
--v      -- show version\n\
--s ENV  -- use an environment variable to substitute the beginning of a path\n\
-           can be used multiple times (-s ENV_VAR -s ENV_VAR)\n");
-	exit(exitval);
+-c file -- do conditional execution based on provided revisor report. Revisor will parse provided report and\n\
+           execute command only if any file was changed\n\
+-n file -- the same as -c but command will be executed without tracking. Revisor will parse report and\n\
+           in case of changes will execute provided command as separate proceess but no tracking of the\n\
+           new procees will be done.\n\
+-s ENV -- specify one or multiple enviroment variables for path substitution. Revisor will read the environment\n\
+           variables and match them with the path's in the report. Matches will be replaced with the variable name\n\
+-v     -- show version\n\
+-h     -- show this message\n");
+  exit(exitval);
 }
 
 static void die(void) __attribute__ ((noreturn));
@@ -911,7 +919,7 @@ startup_child(char **argv)
 {
 	struct stat statbuf;
 	const char *filename;
-	char pathname[MAXPATHLEN];
+	char pathname[PATH_MAX];
 	int pid = 0;
 	struct tcb *tcp;
 
@@ -945,7 +953,7 @@ startup_child(char **argv)
 			else
 				m = n = strlen(path);
 			if (n == 0) {
-				if (!getcwd(pathname, MAXPATHLEN))
+				if (!getcwd(pathname, PATH_MAX))
 					continue;
 				len = strlen(pathname);
 			}
@@ -1036,6 +1044,28 @@ startup_child(char **argv)
 	}
 
 	/* We are the tracer */
+	if (do_not_track) {
+	  int status;
+	  /* Wait for child status change */
+	  pid = waitpid(pid, &status, __WALL);
+	  if (pid == -1) {
+	    perror_msg_and_die("waitpid");
+	  }
+	  /* Detach from the child */
+	  if (ptrace(PTRACE_DETACH,pid,NULL,NULL)<0) {
+	    perror_msg_and_die("ptrace(PTRACE_TRACEME, ...)");
+	  }
+	  /* Wait for process to finish */
+	  pid = waitpid(pid, &status, __WALL);
+	  if (pid == -1) {
+	    perror_msg_and_die("waitpid");
+	  }
+	  if ( status >= 0 && status <= 127) {
+	    exit(status);
+	  } else {
+	    exit(1);
+	  }
+	}
 
 	if (!daemonized_tracer) {
 		if (!use_seize) {
@@ -1386,6 +1416,7 @@ init(int argc, char *argv[])
     int i = 0;
 	int c;
 	int optF = 0;
+        int ret_code = REVISOR_TRIGGER_ERROR;
 	struct sigaction sa;
 
 	progname = argv[0] ? argv[0] : "revisor";
@@ -1415,54 +1446,82 @@ init(int argc, char *argv[])
 	shared_log = stderr;
 	set_sortby(DEFAULT_SORTBY);
 	set_personality(DEFAULT_PERSONALITY);
-	qualify("trace=open,openat,creat,execve");
 	qualify("abbrev=all");
 	qualify("verbose=all");
 	qualify("signal=all");
+	qualify("trace=open,openat,creat,execve,rename,link,symlink");
 	followfork++;
 	qflag = 1;
 	outfname = strdup("/dev/null");
-	while ((c = getopt(argc, argv,"+vh" "o:i:s:")) != EOF) {
-		switch (c) {
-		case 'h':
-			usage(stdout, 0);
-			break;
-		case 'v':
-			printf("%s -- version %s\n", PACKAGE_NAME, VERSION);
-			exit(0);
-			break;
-		case 'o':
-			reportfname = strdup(optarg);
-			break;
-		case 'i':
-			ignorefname = strdup(optarg);
-			break;
-		case 's':
-			substitute_environment_variables[s_env_c] = strdup(optarg);
-			s_env_c += 1;
-			break;
-		default:
-			usage(stderr, 1);
-			break;
-		}
+	while ((c = getopt(argc, argv,"+vh" "c:o:i:n:s:")) != EOF) {
+	  switch (c) {
+	  case 'h':
+	    usage(stdout, 0);
+	    break;
+	  case 'v':
+	    printf("%s -- version %s\n", PACKAGE_NAME, VERSION);
+	    exit(0);
+	    break;
+	  case 'o':
+	    reportfname = strdup(optarg);
+	    break;
+	  case 'i':
+	    ignorefname = strdup(optarg);
+	    break;
+	  case 'c':
+	    inputfname = strdup(optarg);
+	    break;
+	  case 'n':
+	    inputfname = strdup(optarg);
+	    do_not_track = 1;
+	    break;
+	  case 's':
+	    substitute_environment_variables[s_env_c] = strdup(optarg);
+	    s_env_c += 1;
+	    break;
+	  default:
+	    usage(stderr, 1);
+	    break;
+	  }
 	}
 	argv += optind;
 	/* argc -= optind; - no need, argc is not used below */
 
-	if (reportfname == NULL) {
+	if ((reportfname == NULL) && (do_not_track == 0)) {
 	  fprintf(stderr,"-o argument is mandatory\n");
 	    usage(stderr, 1);
 	}
 
-    for(i = 0;i < MAX_S_ENV;i++) {
+	for(i = 0;i < MAX_S_ENV;i++) {
 	  if (substitute_environment_variables[i] == NULL) {
-        break;
-      }
+	    break;
+	  }
 	  if(getenv(substitute_environment_variables[i]) == NULL) {
 	    fprintf(stderr,"the environment variable name supplied with '-s' must be available\n");
-        fprintf(stderr,"error for variable: %s\n", substitute_environment_variables[i]);
-	      usage(stderr, 1);
+	    fprintf(stderr,"error for variable: %s\n", substitute_environment_variables[i]);
+	    usage(stderr, 1);
  	  }
+	}
+
+	/* Check files from input file for changes
+	   and exit if no changes found or error happened
+	   duirng verefication */
+	if (inputfname != NULL) {
+	  ret_code = check_for_changes(inputfname);
+	
+	  if (ret_code == REVISOR_TRIGGER_ERROR) {
+	    fprintf(stderr,"Error during files check\n");
+	    exit(1);
+	  } else if (ret_code == REVISOR_TRIGGER_NO_CHANGES_FOUND) {
+	    fprintf(stdout,"No changes found. Skip command execution\n");
+	    exit(0);
+	  } else if (ret_code == REVISOR_TRIGGER_CHANGES_FOUND) {
+	    fprintf(stdout,"Changes found. Executing provided command...\n");
+	  } else {
+	    fprintf(stderr,"Internal error! Unexpected value(%d) for "
+		    "check_for_changes function return code\n", ret_code);
+	    exit(1);
+	  }
 	}
 
 	acolumn_spaces = malloc(acolumn + 1);

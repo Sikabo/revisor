@@ -18,10 +18,6 @@
 #include <regex.h>
 #include <glib.h>
 
-#ifndef PATH_MAX
-#define PATH_MAX 2000
-#endif
-
 #define REGEX_MAX 1000
 
 /* This is the last created file (it probably didn't exist before the call to create) */
@@ -43,7 +39,71 @@ GTree *ignore_files_tree_g;
 /* Used for storing pre-compiled regex exclusion patterns */
 regex_t *exclude_patterns_compiled_regex_g[REGEX_MAX];
 
+/* Remove /bla/../bla and /bla/./bla/ patterns from the path */
+int
+normalize_path(char *output, char *input) {
+  char result[PATH_MAX]="";
+  size_t resultlen = 0;
+  size_t currentlen = 0;
 
+  char *current = input;
+  char *end = &input[strlen(input)];
+  char *next = NULL;
+  char *slash = NULL;
+
+  /* Check input */
+  if (input == NULL) {
+    fprintf(stderr,"Internal error! Empty input for %s\n",
+	    __FUNCTION__);
+    return EXIT_FAILURE;
+  }
+
+  /* Go slash by slash and fix stuff if we have sonething to fix */
+  for (current = input; current < end; current=next+1) {
+    /* Get pointer to next slash */
+    next = memchr(current, '/', end-current);
+
+    /* stop if not found */
+    if (next == NULL) {
+      next = end;
+    }
+
+    /* Calculate len of current segment */
+    currentlen = next-current;
+
+    /* if current segment len is one or two then we check them */
+    switch(currentlen) {
+    case 2:
+      if (current[0] == '.' && current[1] == '.') {
+	slash = memrchr(result, '/', resultlen);
+	if (slash != NULL) {
+	  resultlen = slash - result;
+	}
+	continue;
+      }
+      break;
+    case 1:
+      if (current[0] == '.') {
+	continue;
+      }
+      break;
+    case 0:
+      continue;
+    }
+    result[resultlen++] = '/';
+    memcpy(&result[resultlen], current, currentlen);
+    resultlen += currentlen;
+  }
+
+  if (resultlen == 0) {
+    result[resultlen++] = '/';
+  }
+
+  result[resultlen] = '\0';
+  strcpy(output,result);
+
+  return EXIT_SUCCESS;
+}
 
 /* Move files from tree to sorted array
 */
@@ -55,7 +115,7 @@ iter_all(gpointer key, gpointer value, gpointer data) {
 }
 
 /* free memory used by the string key
-* This is a callback method called for each key by g_tree_destroy 
+* This is a callback method called for each key by g_tree_destroy
 */
 void
 destroy_key(gpointer data) {
@@ -69,6 +129,12 @@ add_file_to_ignore_filter(char* path_ptr)
 {
   char *path;
   char absp[PATH_MAX];
+
+  if (path_ptr == NULL) {
+    fprintf(stderr,"Internal error! Empty input for %s\n",
+	    __FUNCTION__);
+    return EXIT_FAILURE;
+  }
 
   /* get absolute path */
   if (realpath(path_ptr, absp) == NULL) {
@@ -137,14 +203,19 @@ handle_opened_file(char* path_ptr)
     return EXIT_SUCCESS;
   }
 
-  if (realpath(path_ptr, absp) == NULL) {
-    fprintf(stderr, "realpath failed for %s\n",path_ptr);
-    fprintf(stderr,"Error: %s, errno=%d\n",strerror(errno),errno);
+  /* Fix up path */
+  if (normalize_path(absp, path_ptr) == EXIT_FAILURE) {
+    fprintf(stderr, "Path normalization failed for %s\n",path_ptr);
     return EXIT_FAILURE;
   }
 
   /* Exit function if path already is in the ignore tree  */
   if(g_tree_lookup(ignore_files_tree_g, absp) != NULL) {
+    return EXIT_SUCCESS;
+  }
+
+  /* Exit function if path already is in the tree  */
+  if(g_tree_lookup(tracked_files_tree_g, absp) != NULL) {
     return EXIT_SUCCESS;
   }
 
@@ -157,8 +228,9 @@ handle_opened_file(char* path_ptr)
     reti = regexec(exclude_patterns_compiled_regex_g[i], absp, 0, NULL, 0);
 
     if (!reti) {
-      /* Match to exclude pattern, 
-         add to ignore tree and skip */
+      /* Match to exclude pattern,
+       * add to ignore tree and skip
+       */
       path = strdup(absp);
       g_tree_insert(ignore_files_tree_g, path, &tree_value_g);
 
@@ -171,20 +243,9 @@ handle_opened_file(char* path_ptr)
     }
   }
 
-  /* Exit function if path already is in the tree  */
-  if(g_tree_lookup(tracked_files_tree_g, absp) != NULL) {
-    return EXIT_SUCCESS;
-  }
-
   /* Store string in tracked files */
   path = strdup(absp);
   g_tree_insert(tracked_files_tree_g, path, &tree_value_g);
-
-
-  /* Store string in ignore list */
-  path = strdup(absp);
-  g_tree_insert(ignore_files_tree_g, path, &tree_value_g);
-
 
   return EXIT_SUCCESS;
 }
@@ -220,7 +281,7 @@ update_ignore_list(char* path_ptr)
 
 /* Precompile regex
 */
-int 
+int
 compile_and_store_regex(const char *pattern_ptr, regex_t *regex_ptr) {
   int reti = 0;
   /* Compile regular expression */
@@ -309,10 +370,86 @@ calculate_md5(unsigned char *to, const char *file_path)
   for (i = 0; i < mhash_get_block_size(MHASH_MD5); i++) {
     to[i] = hash[i];
   }
-  
+
   /* Free memory allocated by MD5 checksum calculation */
   free(hash);
-  
+
+  return EXIT_SUCCESS;
+}
+
+/* Check path for environment variables and replace them
+ * with environment variables value
+*/
+int
+replace_env_variables(char *result_ptr, char *input_path_ptr)
+{
+  int i = 0;
+  int j = 0;
+  int last = 0;
+  char path[PATH_MAX] = "";
+  char name[PATH_MAX] = "";
+  char *value_ptr = NULL;
+
+  /* Check input */
+  if (input_path_ptr == NULL) {
+    fprintf(stderr,"Empty string provided as input to %s function\n",__func__);
+    return EXIT_FAILURE;
+  }
+
+  for (i=0;i<strlen(input_path_ptr);i++) {
+    /* If $ found */
+    if ('$' == input_path_ptr[i]) {
+      /* Look for environment variable name end */
+      for (j=i;j<strlen(input_path_ptr);j++) {
+	if ('/' == input_path_ptr[j]) {
+	  break;
+	}
+      }
+      /* Extract env variable name */
+      strncpy(name,input_path_ptr+i+1,j-i-1);
+      /* Get variable value */
+      value_ptr = getenv(name);
+      /* Error if not found */
+      if (value_ptr == NULL) {
+	fprintf(stderr,"Env variable %s used in the report is not set in the current env\n",name);
+	return EXIT_FAILURE;
+      }
+
+      if (last == 0) { /* First env variable found */
+	/* first env variable in the midle of the line (we don't check
+	 * env variable in the beginning becasuse there is nothing to do with it
+	 */
+	if (i > 0) {
+	  /* take first i-1 bytes in the path */
+	  strncpy(path,input_path_ptr,i-1);
+	}
+      } else if (last > 0) { /* Not the first env variable */
+	/* Add to the end path variable path from the end of last env variable
+	 * till current env variable name start
+	 */
+	strncpy(path+strlen(path),input_path_ptr+last,i-last);
+      } else if (last < 0) { /* Something is completly wrong */
+	fprintf(stderr,"Something is really broken here...\n");
+	return EXIT_FAILURE;
+      }
+
+      /* Add value of env variable */
+      strcat(path,value_ptr);
+      /* Remember position for env variable name end */
+      last = j;
+      /* Seek index to the current env variable end */
+      i=j;
+      /* Clean name */
+      memset(name, 0, sizeof(name));;
+    }
+  }
+
+  /* Add remaining part of the string */
+  strcat(path,input_path_ptr+last);
+
+  /* Return result */
+  strcpy(result_ptr,path);
+
   return EXIT_SUCCESS;
 }
 
@@ -355,6 +492,10 @@ dump_result_to_file(char* reportfname, char** substitute_environment_variables)
   for (i = 0; i < nnodes; i++) {
     if(sorted_files_g[i] == NULL)
       break;
+
+    /* Additional check in case of race conditionds  */
+    if(g_tree_lookup(ignore_files_tree_g, sorted_files_g[i]) != NULL)
+      continue;
 
     /* Calculate md5 */
     if(calculate_md5((unsigned char*)&hash, sorted_files_g[i]) != 0) {
@@ -402,6 +543,120 @@ dump_result_to_file(char* reportfname, char** substitute_environment_variables)
   }
 
   return EXIT_SUCCESS;
+}
+
+/* Read report and check fiels for changes
+ */
+int
+check_for_changes(char* inputfname)
+{
+  unsigned char ucurrent_hash[mhash_get_block_size(MHASH_MD5)];
+  char temp_buffer[PATH_MAX + mhash_get_block_size(MHASH_MD5) +1];
+  char input_hash[mhash_get_block_size(MHASH_MD5)];
+  char current_hash[mhash_get_block_size(MHASH_MD5)*2 +1];
+  char path[PATH_MAX];
+  int i = 0;
+  char *loc_ptr = NULL;
+  FILE *fp_ptr = NULL;
+  struct stat file_stat;
+
+  /* No file no check */
+  if (inputfname == NULL)
+    return REVISOR_TRIGGER_CHANGES_FOUND;
+
+  /* Still, no file no check */
+  if (stat(inputfname, &file_stat) < 0) {
+    return REVISOR_TRIGGER_CHANGES_FOUND;
+  }
+
+  /* Read input file */
+  fp_ptr=fopen(inputfname, "r");
+
+  /* Open file failed */
+  if (fp_ptr == NULL) {
+    fprintf(stderr,"Failed to open %s\n",inputfname);
+    fprintf(stderr,"Error: %s, errno=%d\n",strerror(errno),errno);
+    return REVISOR_TRIGGER_ERROR;
+  }
+
+  /* Read file till the end */
+  while(fgets(temp_buffer,PATH_MAX,fp_ptr) != NULL) {
+
+    /* Remove newline character added by fgets */
+    if( temp_buffer[strlen(temp_buffer)-1] == '\n' )
+       temp_buffer[strlen(temp_buffer)-1] = 0;
+
+    /* check line for delimeter and get pointer to the hash */
+    loc_ptr = strtok(temp_buffer,"\t");
+
+    /* Something wrong with input file structure */
+    if (loc_ptr == NULL) {
+      fprintf(stderr,"Could not find delimiter in the %s line\n",temp_buffer);
+      return REVISOR_TRIGGER_ERROR;
+    }
+
+    /* Copy hash to separate variable */
+    if (!strcpy(input_hash,loc_ptr)) {
+	fprintf(stderr,"Failed to extract hash from %s\n",temp_buffer);
+	fprintf(stderr,"Error: %s, errno=%d\n",strerror(errno),errno);
+	return REVISOR_TRIGGER_ERROR;
+    }
+
+    /* Get pointer to path */
+    loc_ptr = strtok(NULL, "\t");
+
+    /* Something wrong with input file structure */
+    if (loc_ptr == NULL) {
+      fprintf(stderr,"Could not find path in the %s line\n",temp_buffer);
+      return REVISOR_TRIGGER_ERROR;
+    }
+
+    /* Get real path without env variables in it */
+    if (replace_env_variables((char*)&path,loc_ptr) == EXIT_FAILURE) {
+      return REVISOR_TRIGGER_ERROR;
+    }
+
+    /* Can't find file from the report - consider rebuild */
+    if (stat(path, &file_stat) < 0) {
+      fprintf(stdout, "%s stated in %s was not found. Consider rebuild\n",
+	      path,
+	      inputfname);
+      return REVISOR_TRIGGER_CHANGES_FOUND;
+    }
+
+    /* Calculate md5 for the file extracted from the input file */
+    if (calculate_md5((unsigned char*)&ucurrent_hash, path) != 0) {
+      fprintf(stderr, "Failed to calculate md5 for '%s'\n", path);
+      return REVISOR_TRIGGER_ERROR;
+    }
+
+    /* We need to transform hash to string to be able to compare it
+       with hash from the file */
+    for(i=0;i<mhash_get_block_size(MHASH_MD5);i++) {
+      sprintf(&current_hash[2*i], "%.2x", ucurrent_hash[i]);
+    }
+
+    /* Compare hash's */
+    if (strcmp(current_hash,input_hash) != 0) {
+      /* Changes found. Return success to continue with build */
+      /* Close file failed */
+      if (fclose(fp_ptr) != 0) {
+	fprintf(stderr,"Failed to close %s\n",inputfname);
+	fprintf(stderr,"Error: %s, errno=%d\n",strerror(errno),errno);
+	return REVISOR_TRIGGER_ERROR;
+      }
+      return  REVISOR_TRIGGER_CHANGES_FOUND;
+    }
+  }
+
+  /* Close file failed */
+  if (fclose(fp_ptr) != 0) {
+    fprintf(stderr,"Failed to close %s\n",inputfname);
+    fprintf(stderr,"Error: %s, errno=%d\n",strerror(errno),errno);
+    return REVISOR_TRIGGER_ERROR;
+  }
+
+  return REVISOR_TRIGGER_NO_CHANGES_FOUND;
 }
 
 /* Create the binary tree-structure
@@ -469,7 +724,6 @@ load_exclude_rules(char* ignorefname)
       if( temp_buffer[len-1] == '\n' )
 	temp_buffer[len-1] = 0;
 
-      
       /* allocate memory */
       regex = malloc(sizeof(regex_t));
       if (!regex) {
@@ -497,3 +751,4 @@ load_exclude_rules(char* ignorefname)
 
   return EXIT_SUCCESS;
 }
+
